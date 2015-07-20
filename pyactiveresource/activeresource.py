@@ -9,7 +9,6 @@ from string import Template
 import six
 from six.moves import urllib, range
 from pyactiveresource import connection
-from pyactiveresource import element_containers
 from pyactiveresource import formats
 from pyactiveresource import util
 
