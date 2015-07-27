@@ -7,6 +7,7 @@ import logging
 import socket
 import sys
 import six
+import time
 from six.moves import urllib
 from pyactiveresource import formats
 
@@ -58,29 +59,6 @@ class ClientError(ConnectionError):
     pass
 
 
-class ResourceConflict(ClientError):
-    """An error raised when there is a resource conflict."""
-    # 409 Conflict
-    pass
-
-
-class ResourceInvalid(ClientError):
-    """An error raised when a resource is invalid."""
-    # 422 Resource Invalid
-    pass
-
-
-class ResourceNotFound(ClientError):
-    """An error raised when a resource is not found."""
-    # 404 Resource Not Found
-
-    def __init__(self, response=None, message=None):
-        if response is not None and message is None:
-            message = '%s: %s' % (response.msg, response.url)
-
-        ClientError.__init__(self, response=response, message=message)
-
-
 class BadRequest(ClientError):
     """An error raised when client sends a bad request."""
     # 400 Bad Request
@@ -99,9 +77,47 @@ class ForbiddenAccess(ClientError):
     pass
 
 
+class ResourceNotFound(ClientError):
+    """An error raised when a resource is not found."""
+    # 404 Resource Not Found
+
+    def __init__(self, response=None, message=None):
+        if response is not None and message is None:
+            message = '%s: %s' % (response.msg, response.url)
+
+        ClientError.__init__(self, response=response, message=message)
+
+
 class MethodNotAllowed(ClientError):
     """An error raised when a method is not allowed."""
     # 405 Method Not Allowed
+    pass
+
+
+class ResourceConflict(ClientError):
+    """An error raised when there is a resource conflict."""
+    # 409 Conflict
+    pass
+
+
+class ResourceInvalid(ClientError):
+    """An error raised when a resource is invalid."""
+    # 422 Resource Invalid
+    pass
+
+
+class TooManyRequests(ClientError):
+    """ An error raised when the server has received too many requests
+        within a given period.
+    """
+    # 429 Too Many Requests
+    pass
+
+
+class MaxRetriesExceeded(ClientError):
+    """ The request has been attempted more times than the connection
+        instance allows.
+    """
     pass
 
 
@@ -124,11 +140,11 @@ class Request(urllib.request.Request):
 
 
 def _urllib_has_timeout():
-  """Determines if our version of urllib.request.urlopen has a timeout argument."""
-  # NOTE: This is a terrible hack, but there's no other indication that this
-  #     argument was added to the function.
-  version = sys.version_info
-  return version[0] >= 2 and version[1] >= 6
+    """Determines if our version of urllib.request.urlopen has a timeout argument."""
+    # NOTE: This is a terrible hack, but there's no other indication that this
+    #     argument was added to the function.
+    version = sys.version_info
+    return version[0] >= 2 and version[1] >= 6
 
 
 class Response(object):
@@ -189,8 +205,9 @@ class Connection(object):
     """A connection object to interface with REST services."""
 
     def __init__(self, site, user=None, password=None, timeout=None,
-                 format=formats.JSONFormat):
-    
+                 format=formats.JSONFormat, retry_exceptions=[TooManyRequests],
+                 max_attempts=1, max_retry_wait_in_ms=10000):
+
         """Initialize a new Connection object.
 
         Args:
@@ -199,6 +216,8 @@ class Connection(object):
             password: password for basic authentication.
             timeout: socket timeout.
             format: format object for en/decoding resource data.
+            retry_exceptions: list of exceptions that should trigger
+                              connection retry conditions.
         """
 
         if site is None:
@@ -214,6 +233,9 @@ class Connection(object):
         self.timeout = timeout
         self.log = logging.getLogger('pyactiveresource.connection')
         self.format = format
+        self.retry_exceptions = retry_exceptions
+        self.max_attempts = max_attempts
+        self.max_retry_wait_in_ms = max_retry_wait_in_ms
 
     def _parse_site(self, site):
         """Retrieve the auth information and base url for a site.
@@ -272,9 +294,9 @@ class Connection(object):
             request.data = data
             self.log.debug('request-body:%s', request.data)
         elif method in ['POST', 'PUT']:
-          # Some web servers need a content length on all POST/PUT operations
-          request.add_header('Content-Type', self.format.mime_type)
-          request.add_header('Content-Length', '0')
+            # Some web servers need a content length on all POST/PUT operations
+            request.add_header('Content-Type', self.format.mime_type)
+            request.add_header('Content-Length', '0')
 
         if self.timeout and not _urllib_has_timeout():
             # Hack around lack of timeout option in python < 2.6
@@ -282,12 +304,7 @@ class Connection(object):
             socket.setdefaulttimeout(self.timeout)
         try:
             http_response = None
-            try:
-                http_response = self._handle_error(self._urlopen(request))
-            except urllib.error.HTTPError as err:
-                http_response = self._handle_error(err)
-            except urllib.error.URLError as err:
-                raise Error(err, url)
+            http_response = self.attempt_request(url, request)
             response = Response.from_httpresponse(http_response)
             self.log.debug('Response(code=%d, headers=%s, msg="%s")',
                            response.code, response.headers, response.msg)
@@ -313,9 +330,49 @@ class Connection(object):
             urllib.error.URLError on IO errors.
         """
         if _urllib_has_timeout():
-          return urllib.request.urlopen(request, timeout=self.timeout)
+            return urllib.request.urlopen(request, timeout=self.timeout)
         else:
-          return urllib.request.urlopen(request)
+            return urllib.request.urlopen(request)
+
+    def attempt_request(self, url, request):
+        num_attempts = 0
+        self.latest_connection_exception = None
+
+        while self.should_attempt_request(num_attempts):
+            try:
+                http_response = self.make_connection(url, request)
+            except self.retry_exceptions as e:
+                self.latest_connection_exception = e
+            finally:
+                num_attempts += 1
+
+        return http_response
+
+    def make_connection(self, url, request):
+        try:
+            http_response = self._handle_error(self._urlopen(request))
+        except urllib.error.HTTPError as err:
+            http_response = self._handle_error(err)
+        except urllib.error.URLError as err:
+            raise Error(err, url)
+
+        return http_response
+
+    def should_attempt_request(self, num_attempts):
+        exception_allowed = self.latest_connection_exception.__class__ in self.retry_exceptions
+
+        if num_attempts >= self.max_attempts:
+            return False
+        if exception_allowed:
+            time.sleep(self.get_wait_period_in_seconds(num_attempts))
+
+        return True
+
+    def get_wait_period_in_seconds(self, num_attempts):
+        # Exponential back-off
+        wait_period_in_ms = 2*num_attempts * 1000
+        wait_period = wait_period_in_ms if wait_period_in_ms < max_retry_wait_in_ms else max_retry_wait_in_ms
+        return float('.%d' % wait_period)
 
     def get(self, path, headers=None):
         """Perform an HTTP get request.
@@ -412,6 +469,8 @@ class Connection(object):
             raise ResourceConflict(err)
         elif err.code == 422:
             raise ResourceInvalid(err)
+        elif err.code == 429:
+            raise TooManyRequests(err)
         elif 401 <= err.code < 500:
             raise ClientError(err)
         elif 500 <= err.code < 600:

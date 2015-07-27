@@ -98,6 +98,10 @@ class ConnectionTest(unittest.TestCase):
         for code in [199, 600]:
             self.assert_response_raises(connection.ConnectionError, code)
 
+    def test_handle_too_many_requests(self):
+        # 405 is a missing not allowed error
+        self.assert_response_raises(connection.TooManyRequests, 429)
+
     def test_timeout_attribute(self):
         self.connection.timeout = 7
         self.assertEqual(7, self.connection.timeout)
@@ -200,6 +204,35 @@ class ConnectionTest(unittest.TestCase):
         self.http.respond_to('DELETE', '/people/2.json', self.header, '')
         response = self.connection.delete('/people/2.json', self.header)
         self.assertEqual(200, response.code)
+
+    def test_too_many_requests_retry(self):
+        retry_connection = connection.Connection(
+            self.http.site, max_attempts=5)
+
+        person = util.to_json({'id': 1, 'name': 'Matz'}, root='person')
+        self.http.respond_to(
+            'GET', '/people/1.json', {}, person, code=429)
+        self.format = formats.JSONFormat
+        self.assertRaises(
+            connection.TooManyRequests, retry_connection.get, '/people/1.json', '')
+
+    def test_retry_max_attempts(self):
+        retry_connection = connection.Connection(self.http.site, max_attempts=5)
+        person = util.to_json({'id': 1, 'name': 'Matz'}, root='person')
+        self.http.respond_to(
+            'GET', '/people/1.json', {}, person, code=429)
+        self.format = formats.JSONFormat
+
+        self.assertRaises(
+            connection.TooManyRequests, retry_connection.get, '/people/1.json', '')
+
+        self.assertEqual(retry_connection.num_attempts, 5)
+
+    def test_exponential_backoff(self):
+        retry_connection = connection.Connection(
+            self.http.site, max_attempts=5)
+
+        self.assertEqual()
 
 '''
   ResponseHeaderStub = Struct.new(:code, :message, 'Allow')

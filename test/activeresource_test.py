@@ -23,6 +23,7 @@ class Error(Exception):
 class Store(activeresource.ActiveResource):
     _site = 'http://localhost'
 
+
 class Address(activeresource.ActiveResource):
     _site = 'http://localhost/people/$person_id/'
 
